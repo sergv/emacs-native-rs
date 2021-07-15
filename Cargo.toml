@@ -5,14 +5,18 @@ authors = ["Sergey Vinokurov <serg.foo@gmail.com>"]
 edition = "2018"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["rlib", "cdylib"]
+name = "emacs_native_rs"
+path = "src/lib.rs"
+
+[[bench]]
+name = "bench-fs-search"
+path = "src/bin/bench_fs_search.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 emacs = ">= 0.17"
-# regex = ">= 1.5.7"
-glob  = ">= 0.3"
-
-# ignore = ">= 0.4.18"
-ignore = { path = "ripgrep/crates/ignore" }
+crossbeam = ">= 0.8.1"
+globset = ">= 0.4.8"
+crossbeam-utils = ">= 0.8.0"
