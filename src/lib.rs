@@ -1,29 +1,23 @@
-// #[cfg(test)]
-// mod tests {
-//     #[test]
-//     fn it_works() {
-//         assert_eq!(2 + 2, 4);
-//     }
-// }
+
+#![allow(unused_mut)]
 
 use std::iter::IntoIterator;
-use std::mem::MaybeUninit;
-use std::path::{PathBuf};
+use std::path::{PathBuf, Path};
 use std::result;
-use std::sync::Barrier;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
-// use crossbeam_channel::bounded;
-use crossbeam::queue::ArrayQueue;
-
-use crossbeam;
-use crossbeam::thread::ScopedJoinHandle;
-use globset::{Glob, GlobSet, GlobBuilder, GlobSetBuilder};
-
+use anyhow;
+use emacs;
 use emacs::{defun, Env, Result, Value, Vector, FromLisp, IntoLisp};
+use grep::matcher::Matcher;
+use grep::regex::{RegexMatcher, RegexMatcherBuilder};
+use grep::searcher::{self, Searcher, SearcherBuilder};
+use pathdiff;
 
+pub mod find;
+pub mod fuzzy_match;
 
-emacs::use_symbols!(nil);
+emacs::use_symbols!(nil make_egrep_match);
 
 // Emacs won't load the module without this.
 emacs::plugin_is_GPL_compatible!();
@@ -34,197 +28,28 @@ fn init(env: &Env) -> Result<Value<'_>> {
     ().into_lisp(env)
 }
 
-fn mk_glob(pat: &str) -> result::Result<Glob, globset::Error> {
-    let mut b = GlobBuilder::new(pat);
-    b.case_insensitive(true);
-    b.literal_separator(false);
-    b.backslash_escape(false);
-    b.build()
-}
-
-
-fn glob_should_test_against_abs(pat: &str) -> bool {
-    pat.chars().any(std::path::is_separator)
-    // std::path::Path::new(pat).is_absolute()
-}
-
-const THREADS: usize = 2;
-
-struct GlobEntry {
-    rel: GlobSet,
-    abs: GlobSet,
-}
-
-struct IgnoreAllow {
-    ignore: GlobEntry,
-    allow: GlobEntry,
-    have_rel: bool,
-    have_abs: bool,
-}
-
-impl GlobEntry {
-    fn is_match(&self, entry: &std::fs::DirEntry, cache_path: &mut Option<PathBuf>) -> bool {
-        if self.rel.is_match(entry.file_name()) {
-            true
-        } else if !self.abs.is_empty() {
-            let p = entry.path();
-            let res = self.abs.is_match(&p);
-            // Store expensive-to-compute path so that it may be reused.
-            *cache_path = Some(p);
-            res
+#[defun]
+fn binary_search<'a>(
+    needle: i64,
+    haystack: Vector,
+) -> Result<bool>
+{
+    let mut start = 0;
+    let mut end = haystack.len();
+    let mut mid = end / 2;
+    while start != end {
+        let x: i64 = i64::from_lisp(haystack.get(mid)?)?;
+        if x == needle {
+            return Ok(true);
+        }
+        if x < needle {
+            start = mid + 1;
         } else {
-            false
+            end = mid;
         }
+        mid = (start + end) / 2;
     }
-}
-
-impl IgnoreAllow {
-    fn new(ignore: GlobEntry, allow: GlobEntry) -> Self {
-        let have_rel = !ignore.rel.is_empty() || !allow.rel.is_empty();
-        let have_abs = !ignore.abs.is_empty() || !allow.abs.is_empty();
-        IgnoreAllow { ignore, allow, have_rel, have_abs }
-    }
-
-    fn is_match(&self, entry: &std::fs::DirEntry, cache_path: &mut Option<PathBuf>) -> bool {
-        if self.have_rel {
-            let name = entry.file_name();
-            let rel_cand = globset::Candidate::new(&name);
-
-            if self.ignore.rel.is_match_candidate(&rel_cand) {
-                return false;
-            }
-
-            if self.have_abs {
-                let path = entry.path();
-                let abs_cand = globset::Candidate::new(&path);
-
-                if self.ignore.abs.is_match_candidate(&abs_cand) {
-                    *cache_path = Some(path);
-                    return false;
-                }
-
-                let res =
-                    self.allow.rel.is_match_candidate(&rel_cand) ||
-                    self.allow.abs.is_match_candidate(&abs_cand);
-
-                // Store expensive-to-compute path so that it may be reused.
-                *cache_path = Some(path);
-
-                res
-            } else {
-                self.allow.rel.is_match_candidate(&rel_cand)
-            }
-        } else if self.have_abs {
-            let path = entry.path();
-            let path_cand = globset::Candidate::new(&path);
-            let res =
-                !self.ignore.abs.is_match_candidate(&path_cand) &&
-                self.allow.abs.is_match_candidate(&path_cand);
-            *cache_path = Some(path);
-            res
-        } else {
-            false
-        }
-    }
-}
-
-pub struct Ignores {
-    files: IgnoreAllow,
-    ignored_dirs: GlobEntry,
-}
-
-impl Ignores {
-    pub fn new<E, I1, I2, I3, I4, S1, S2, S3, S4>(
-        globs: I1,
-        ignored_file_globs: I2,
-        ignored_dir_globs: I3,
-        ignored_dir_prefixes_globs: I4
-    ) -> result::Result<Self, E>
-        where
-        E: From<globset::Error>,
-        I1: Iterator<Item = result::Result<S1, E>>,
-        I2: Iterator<Item = result::Result<S2, E>>,
-        I3: Iterator<Item = result::Result<S3, E>>,
-        I4: Iterator<Item = result::Result<S4, E>>,
-        S1: AsRef<str>,
-        S2: AsRef<str>,
-        S3: AsRef<str>,
-        S4: AsRef<str>,
-    {
-        let mut wanted_file_abs_builder = GlobSetBuilder::new();
-        let mut wanted_file_rel_builder = GlobSetBuilder::new();
-        let mut ignored_file_abs_builder = GlobSetBuilder::new();
-        let mut ignored_file_rel_builder = GlobSetBuilder::new();
-        let mut ignored_dir_abs_builder = GlobSetBuilder::new();
-        let mut ignored_dir_rel_builder = GlobSetBuilder::new();
-
-        for x in globs {
-            let y = x?;
-            let z = y.as_ref();
-            let g = mk_glob(z)?;
-            if glob_should_test_against_abs(z) {
-                wanted_file_abs_builder.add(g);
-            } else {
-                wanted_file_rel_builder.add(g);
-            }
-        }
-        for x in ignored_file_globs {
-            let y = x?;
-            let z = y.as_ref();
-            let g = mk_glob(z)?;
-            if glob_should_test_against_abs(z) {
-                ignored_file_abs_builder.add(g);
-            } else {
-                ignored_file_rel_builder.add(g);
-            }
-        }
-
-        {
-            let mut tmp = String::new();
-            for x in ignored_dir_globs {
-                let y = x?;
-                let z = y.as_ref();
-                tmp.push_str("**/");
-                tmp.extend(z.chars());
-                let g = mk_glob(&tmp)?;
-                if glob_should_test_against_abs(z) {
-                    ignored_dir_abs_builder.add(g);
-                } else {
-                    ignored_dir_rel_builder.add(g);
-                }
-                tmp.clear();
-            }
-            for x in ignored_dir_prefixes_globs {
-                let y = x?;
-                let z = y.as_ref();
-                tmp.push_str("**/");
-                tmp.extend(z.chars());
-                tmp.push('*');
-                let g = mk_glob(&tmp)?;
-                if glob_should_test_against_abs(z) {
-                    ignored_dir_abs_builder.add(g);
-                } else {
-                    ignored_dir_rel_builder.add(g);
-                }
-                tmp.clear();
-            }
-        }
-
-        let wanted_files_rel = wanted_file_rel_builder.build()?;
-        let wanted_files_abs = wanted_file_abs_builder.build()?;
-        let ignored_files_rel = ignored_file_rel_builder.build()?;
-        let ignored_files_abs = ignored_file_abs_builder.build()?;
-        let ignored_dirs_rel = ignored_dir_rel_builder.build()?;
-        let ignored_dirs_abs = ignored_dir_abs_builder.build()?;
-
-        Ok(Ignores {
-            files: IgnoreAllow::new(
-                GlobEntry { rel: ignored_files_rel, abs: ignored_files_abs },
-                GlobEntry { rel: wanted_files_rel, abs: wanted_files_abs }
-            ),
-            ignored_dirs: GlobEntry { rel: ignored_dirs_rel, abs: ignored_dirs_abs },
-        })
-    }
+    return Ok(false)
 }
 
 #[defun]
@@ -235,6 +60,7 @@ fn find_rec<'a>(
     input_ignored_file_globs: Vector,
     input_ignored_dir_globs: Vector,
     input_ignored_dir_prefixes_globs: Vector,
+    input_ignored_abs_dirs: Vector,
 ) -> Result<Value<'a>>
 {
     // let roots_count = input_roots.len();
@@ -244,213 +70,24 @@ fn find_rec<'a>(
     let ignored_file_globs = to_strings_iter(input_ignored_file_globs);
     let ignored_dir_globs = to_strings_iter(input_ignored_dir_globs);
     let ignored_dir_prefixes_globs = to_strings_iter(input_ignored_dir_prefixes_globs);
+    let ignored_abs_dirs = to_strings_iter(input_ignored_abs_dirs);
 
-    let ignores = Ignores::new(globs, ignored_file_globs, ignored_dir_globs, ignored_dir_prefixes_globs)?;
+    let ignores = find::Ignores::new(globs, ignored_file_globs, ignored_dir_globs, ignored_dir_prefixes_globs, ignored_abs_dirs)?;
 
-    let mut s = StringsState::new(env)?;
+    let mut s = SuccessesAndErrors::new(env)?;
 
-    find_rec_impl(
+    find::find_rec(
         roots,
         &ignores,
-        |x| s.update(x)
+        || Ok(()),
+        |_state, _orig_root: (), x, chan| {
+            chan.send(path_to_string(x)).map_err(anyhow::Error::new)
+        },
+        |y| s.update(y)
     )?;
 
     let (files, errs) = s.finalize()?;
     env.cons(files, errs)
-}
-
-// Define a function callable by Lisp.
-pub fn find_rec_impl<'a, S, I, F, E>(
-    roots: I,
-    ignores: &Ignores,
-    mut consume: F,
-) -> result::Result<(), E>
-    where
-    F: FnMut(result::Result<String, String>) -> result::Result<(), E>,
-    I: Iterator<Item = result::Result<S, E>> + ExactSizeIterator,
-    S: AsRef<str>,
-{
-    let (report_result, receive_result) = mpsc::sync_channel(2 * THREADS);
-    let roots_count = roots.len();
-
-    let tasks_queue = ArrayQueue::new((10 * THREADS).max(roots_count));
-
-    for r in roots {
-        let path = std::path::PathBuf::from(std::ffi::OsString::from(r?.as_ref()));
-        if !ignores.ignored_dirs.abs.is_match(&path) && !ignores.ignored_dirs.rel.is_match(&path) {
-            tasks_queue.push(path).expect("Task queue should have enough size to hold initial set of roots");
-        }
-    }
-
-    let tasks = &tasks_queue;
-
-    let barr = Barrier::new(THREADS);
-    let barr_ref = &barr;
-
-    crossbeam::scope(
-        move |s| -> result::Result<_, _> {
-
-            let main_handle: ScopedJoinHandle<_> = {
-                let private_report_result = report_result.clone();
-                s.spawn(
-                    move |_| -> result::Result<_, _> {
-                        process_main(
-                            barr_ref,
-                            tasks,
-                            private_report_result,
-                            ignores,
-                        )
-                    }
-                )
-            };
-
-            const INIT: MaybeUninit<ScopedJoinHandle<Result<()>>> = MaybeUninit::uninit();
-            let mut handles: [_; THREADS] = [INIT; THREADS];
-            handles[0] = MaybeUninit::new(main_handle);
-
-            for i in 1..THREADS {
-                let private_report_result = report_result.clone();
-                let id: ScopedJoinHandle<_> = s.spawn(
-                    move |_| -> result::Result<_, _> {
-                        process_child(
-                            barr_ref,
-                            tasks,
-                            private_report_result,
-                            ignores,
-                        )
-                    }
-                );
-                handles[i] = MaybeUninit::new(id);
-            }
-
-            std::mem::drop(report_result);
-            while let Ok(x) = receive_result.recv() {
-               consume(x)?
-            }
-
-            for h in handles {
-                unsafe {
-                    h.assume_init().join().unwrap().unwrap();
-                }
-            }
-
-            Ok(())
-        }
-    ).unwrap()
-}
-
-fn process_main(
-    barr: &Barrier,
-    tasks: &ArrayQueue<PathBuf>,
-    report_result: mpsc::SyncSender<result::Result<String, String>>,
-    ignores: &Ignores,
-) -> Result<()>
-{
-    let mut children_awoken = false;
-
-    let mut local_queue: Vec<PathBuf> = Vec::new();
-    loop {
-        let root: PathBuf = match local_queue.pop() {
-            Some(x) =>
-                match tasks.push(x) {
-                    Ok(()) => continue,
-                    Err(y) => y,
-                },
-            None => match tasks.pop() {
-                Some(x) => x,
-                None => break,
-            },
-        };
-
-        process_dir(
-            root,
-            ignores,
-            |path| match tasks.push(path) {
-                Ok(()) => (),
-                Err(path) => {
-                    local_queue.push(path);
-                }
-            },
-            |x| { Ok(report_result.send(x)?) },
-        )?;
-
-        if !children_awoken && tasks.is_full() {
-            // Wake up children.
-            barr.wait();
-            children_awoken = true;
-        }
-    }
-    Ok(())
-}
-
-fn process_child(
-    barr: &Barrier,
-    tasks: &ArrayQueue<PathBuf>,
-    report_result: mpsc::SyncSender<result::Result<String, String>>,
-    ignores: &Ignores,
-) -> Result<()>
-{
-    barr.wait();
-
-    let mut local_queue: Vec<PathBuf> = Vec::new();
-    loop {
-        let root: PathBuf = match local_queue.pop() {
-            Some(x) =>
-                match tasks.push(x) {
-                    Ok(()) => continue,
-                    Err(y) => y,
-                },
-            None => match tasks.pop() {
-                Some(x) => x,
-                None => break,
-            },
-        };
-
-        process_dir(
-            root,
-            ignores,
-            |path| match tasks.push(path) {
-                Ok(()) => (),
-                Err(path) => {
-                    local_queue.push(path);
-                }
-            },
-            |x| { Ok(report_result.send(x)?) },
-        )?;
-    }
-    Ok(())
-}
-
-fn process_dir<D, F>(
-    root: PathBuf,
-    ignores: &Ignores,
-    mut record_dir: D,
-    mut record_file: F,
-) -> Result<()>
-    where
-    D: FnMut(PathBuf) -> (),
-    F: FnMut(result::Result<String, String>) -> Result<()>,
-{
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let typ = entry.file_type()?;
-        let mut tmp = None;
-        if typ.is_dir() {
-            if !ignores.ignored_dirs.is_match(&entry, &mut tmp) {
-                let path = tmp.unwrap_or_else(|| entry.path());
-                record_dir(path);
-            }
-        } else if typ.is_file() {
-            if ignores.files.is_match(&entry, &mut tmp) {
-                let path = tmp.unwrap_or_else(|| entry.path());
-                record_file(match path.to_str() {
-                    None => Err(format!("Invalid file name: {:?}", path)),
-                    Some(x) => Ok(x.to_string()),
-                })?
-            }
-        }
-    }
-    Ok(())
 }
 
 // Define a function callable by Lisp.
@@ -462,6 +99,7 @@ fn find_rec_serial<'a>(
     input_ignored_file_globs: Vector,
     input_ignored_dir_globs: Vector,
     input_ignored_dir_prefixes_globs: Vector,
+    input_ignored_abs_dirs: Vector,
 ) -> Result<Value<'a>>
 {
     let roots = to_strings_iter(input_roots);
@@ -469,8 +107,9 @@ fn find_rec_serial<'a>(
     let ignored_file_globs = to_strings_iter(input_ignored_file_globs);
     let ignored_dir_globs = to_strings_iter(input_ignored_dir_globs);
     let ignored_dir_prefixes_globs = to_strings_iter(input_ignored_dir_prefixes_globs);
+    let ignored_abs_dirs = to_strings_iter(input_ignored_abs_dirs);
 
-    let ignores = &Ignores::new(globs, ignored_file_globs, ignored_dir_globs, ignored_dir_prefixes_globs)?;
+    let ignores = &find::Ignores::new(globs, ignored_file_globs, ignored_dir_globs, ignored_dir_prefixes_globs, ignored_abs_dirs)?;
 
     let mut local_queue: Vec<PathBuf> = Vec::new();
     for r in roots {
@@ -480,7 +119,7 @@ fn find_rec_serial<'a>(
         }
     }
 
-    let mut s = StringsState::new(env)?;
+    let mut s = SuccessesAndErrors::new(env)?;
 
     loop {
         let root: PathBuf =
@@ -489,15 +128,80 @@ fn find_rec_serial<'a>(
                 None => break,
             };
 
-        process_dir(
+        find::visit_dir(
             root,
             &ignores,
             |p| local_queue.push(p),
-            |x| s.update(x),
+            |x| s.update(path_to_string(x)),
         )?
     }
     let (files, errs) = s.finalize()?;
     env.cons(files, errs)
+}
+
+#[defun]
+fn grep<'a>(
+    env: &'a Env,
+    input_roots: Vector,
+    regexp: String,
+    input_globs: Vector,
+    input_ignored_file_globs: Vector,
+    input_ignored_dir_globs: Vector,
+    input_ignored_dir_prefixes_globs: Vector,
+    input_ignored_abs_dirs: Vector,
+    input_case_insensitive: Value,
+) -> Result<Value<'a>>
+{
+    // let roots_count = input_roots.len();
+    let roots = to_strings_iter(input_roots);
+
+    let globs = to_strings_iter(input_globs);
+    let ignored_file_globs = to_strings_iter(input_ignored_file_globs);
+    let ignored_dir_globs = to_strings_iter(input_ignored_dir_globs);
+    let ignored_dir_prefixes_globs = to_strings_iter(input_ignored_dir_prefixes_globs);
+    let ignored_abs_dirs = to_strings_iter(input_ignored_abs_dirs);
+
+    let case_insensitive = !nil.bind(env).eq(input_case_insensitive);
+
+    let ignores = find::Ignores::new(globs, ignored_file_globs, ignored_dir_globs, ignored_dir_prefixes_globs, ignored_abs_dirs)?;
+
+    let mut results = Successes::new(env)?;
+
+    find::find_rec(
+        roots,
+        &ignores,
+        || {
+            let searcher = SearcherBuilder::new()
+                .line_number(true)
+                .multi_line(true)
+                .memory_map(unsafe { grep::searcher::MmapChoice::auto() })
+                .binary_detection(grep::searcher::BinaryDetection::none())
+                .build();
+
+            let matcher = RegexMatcherBuilder::new()
+                .case_insensitive(case_insensitive)
+                .multi_line(true)
+                .build(&regexp)?;
+
+            Ok((searcher, matcher))
+        },
+        |(searcher, matcher), orig_root: Arc<PathBuf>, path, results| {
+            let sink = GrepSink {
+                rel_path_cache: None,
+                abs_path_cache: None,
+                abs_path: &path,
+                orig_root: &*orig_root,
+                matcher: &matcher,
+                results: &results,
+            };
+            searcher.search_path(&*matcher, &path, sink).map_err(|x| x.err)
+        },
+        |m| {
+            results.update(m)
+        }
+    )?;
+
+    results.finalize()?.into_lisp(env)
 }
 
 // fn extract_strings(input: Vector) -> Result<Vec<String>> {
@@ -506,6 +210,172 @@ fn find_rec_serial<'a>(
 //         .map(String::from_lisp)
 //         .collect::<Result<_>>()
 // }
+
+struct EmacsPath {
+    path: String,
+}
+
+impl EmacsPath {
+    fn new(path: PathBuf) -> result::Result<Self, Error> {
+        match path.into_os_string().into_string() {
+            Err(err) => Err(Error::msg(format!("Path has invalid utf8 encoding: {:?}", err))),
+            Ok(s) => {
+                #[cfg(target_family = "windows")]
+                let path = unsafe {
+                    for b in s.as_bytes_mut() {
+                        match b {
+                            b'\\' => *b = b'/',
+                            _ => (),
+                        }
+                    }
+                    s
+                };
+                #[cfg(target_family = "unix")]
+                let path = s;
+                Ok(EmacsPath { path })
+            }
+        }
+    }
+}
+
+impl<'a> emacs::IntoLisp<'a> for &EmacsPath {
+    fn into_lisp(self, env: &'a Env) -> Result<Value<'a>> {
+        self.path.clone().into_lisp(env)
+    }
+}
+
+struct Match {
+    line: u64,
+    byte_offset: u64,
+    prefix: String,
+    body: String,
+    suffix: String,
+    abs_path: Arc<EmacsPath>,
+    rel_path: Arc<EmacsPath>,
+}
+
+impl<'a> emacs::IntoLisp<'a> for Match {
+    fn into_lisp(self, env: &'a Env) -> Result<Value<'a>> {
+        env.call(
+            make_egrep_match,
+            (&*self.abs_path,
+             &*self.rel_path,
+             self.line,
+             self.byte_offset,
+             self.prefix,
+             self.body,
+             self.suffix
+            )
+        )
+    }
+}
+
+struct GrepSink<'a, 'b, 'c> {
+    rel_path_cache: Option<Arc<EmacsPath>>,
+    abs_path_cache: Option<Arc<EmacsPath>>,
+    abs_path: &'a Path,
+    orig_root: &'a Path,
+    matcher: &'b RegexMatcher,
+    results: &'c mpsc::SyncSender<Match>,
+}
+
+struct Error {
+    err: emacs::Error,
+}
+
+impl Error {
+    fn msg<T>(msg: T) -> Self
+        where
+        T: std::fmt::Display + std::fmt::Debug + Send + Sync + 'static
+    {
+        Error {
+            err: emacs::Error::msg(msg)
+        }
+    }
+}
+
+impl searcher::SinkError for Error {
+    fn error_message<T: std::fmt::Display>(message: T) -> Self {
+        Error::msg(message.to_string())
+    }
+}
+
+impl<'a, 'b, 'c> searcher::Sink for GrepSink<'a, 'b, 'c> {
+    type Error = Error;
+
+    fn matched(&mut self, _searcher: &Searcher, m: &searcher::SinkMatch) -> result::Result<bool, Self::Error> {
+        let line = m.line_number().expect("Line numbers must be available");
+        let byte_offset = m.absolute_byte_offset();
+        let matched_lines = m.bytes();
+
+        let rel_path = match self.rel_path_cache {
+            Some(ref x) => x,
+            None => {
+                let path = match pathdiff::diff_paths(self.abs_path, self.orig_root) {
+                    None => return Err(Error::msg(format!(
+                        "Invariant violation: abs_path {:?} should be under orig_root {:?}",
+                        self.abs_path,
+                        self.orig_root
+                    ))),
+                    Some(x) => x,
+                };
+                self.rel_path_cache = Some(Arc::new(EmacsPath::new(path)?));
+                self.rel_path_cache.as_ref().unwrap()
+            }
+        };
+
+        let abs_path = match self.abs_path_cache {
+            Some(ref x) => x,
+            None => {
+                self.abs_path_cache = Some(Arc::new(EmacsPath::new(self.abs_path.to_owned())?));
+                self.abs_path_cache.as_ref().unwrap()
+            }
+        };
+
+        let submatch = self.matcher.find(matched_lines).unwrap().expect("Match is guaranteed to be found");
+
+        let prefix = std::str::from_utf8(&matched_lines[..submatch.start()])
+            .map_err(|err| Error::msg(format!("Failed to utf-8 encode match prefix: {}", err)))?;
+        let body = std::str::from_utf8(&matched_lines[submatch])
+            .map_err(|err| Error::msg(format!("Failed to utf-8 encode match body: {}", err)))?;
+        let suffix = std::str::from_utf8(&matched_lines[submatch.end()..])
+            .map_err(|err| Error::msg(format!("Failed to utf-8 encode match suffix: {}", err)))?
+            .trim_end_matches(|c| c == '\r' || c == '\n');
+
+        self.results.send(Match {
+            line,
+            byte_offset,
+            prefix: prefix.to_string(),
+            body: body.to_string(),
+            suffix: suffix.to_string(),
+            rel_path: rel_path.clone(),
+            abs_path: abs_path.clone(),
+        }).map_err(|err| Error::msg(format!("Failed to send match: {}", err)))?;
+
+        // println!(
+        //     "{}:{}@{}@@{:?}:{:?}",
+        //     rel_path.display(),
+        //     line,
+        //     offset,
+        //     m.bytes_range_in_buffer(),
+        //     submatch
+        //     // std::str::from_utf8(text)
+        // );
+
+        // let len = m.
+
+            // env.call_unprotected("", args)
+
+        Ok(true)
+    }
+}
+
+fn path_to_string(path: PathBuf) -> result::Result<String, String> {
+    match path.to_str() {
+        None => Err(format!("Invalid file name: {:?}", path)),
+        Some(x) => Ok(x.to_string()),
+    }
+}
 
 fn to_strings_iter<'a>(input: Vector<'a>) -> impl Iterator<Item = Result<String>> + ExactSizeIterator + 'a {
     input
@@ -530,7 +400,7 @@ fn take<'a>(env: &'a Env, count: usize, v: Vector<'a>) -> Result<Vector<'a>> {
     Ok(res)
 }
 
-struct StringsState<'a> {
+struct SuccessesAndErrors<'a> {
     env: &'a Env,
 
     a: Vector<'a>,
@@ -542,9 +412,9 @@ struct StringsState<'a> {
     size_b: usize,
 }
 
-impl<'a> StringsState<'a> {
-    fn new(env: &'a Env) -> Result<StringsState> {
-        Ok(StringsState {
+impl<'a> SuccessesAndErrors<'a> {
+    fn new(env: &'a Env) -> Result<SuccessesAndErrors> {
+        Ok(SuccessesAndErrors {
             env,
 
             a: env.make_vector(0, nil)?,
@@ -592,17 +462,40 @@ impl<'a> StringsState<'a> {
     }
 }
 
-// fn make_strings<'a, I, A, B>(env: &'a Env, items: I) -> Result<(Vector<'a>, Vector<'a>)>
-//     where
-//     I: IntoIterator<Item = result::Result<A, B>>,
-//     A: IntoLisp<'a>,
-//     B: IntoLisp<'a>,
-// {
-//     let mut s = StringsState::new(env)?;
-//
-//     for x in items {
-//         s.update(x)?;
-//     }
-//
-//     s.finalize()
-// }
+struct Successes<'a> {
+    env: &'a Env,
+
+    items: Vector<'a>,
+    cap: usize,
+    size: usize,
+}
+
+impl<'a> Successes<'a> {
+    fn new(env: &'a Env) -> Result<Successes> {
+        Ok(Successes {
+            env,
+            items: env.make_vector(0, nil)?,
+            cap: 0,
+            size: 0,
+        })
+    }
+
+    fn update<A>(&mut self, x: A) -> Result<()>
+        where
+        A: IntoLisp<'a>,
+    {
+        let new_size = self.size + 1;
+        if new_size > self.cap {
+            self.items = resize(self.env, self.items)?;
+            self.cap = self.items.len();
+        }
+        self.items.set(self.size, x.into_lisp(self.env)?)?;
+        self.size = new_size;
+        Ok(())
+    }
+
+    fn finalize(self) -> Result<Vector<'a>> {
+        let a = take(self.env, self.size, self.items)?;
+        Ok(a)
+    }
+}

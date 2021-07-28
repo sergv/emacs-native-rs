@@ -16,7 +16,17 @@ path = "src/bin/bench_fs_search.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-emacs = ">= 0.17"
+# Error handling
+anyhow = ">= 1.0.38"
 crossbeam = ">= 0.8.1"
-globset = ">= 0.4.8"
 crossbeam-utils = ">= 0.8.0"
+emacs = ">= 0.17"
+globset = ">= 0.4.8"
+pathdiff = ">= 0.1"
+
+grep = ">= 0.2.8"
+# Requires nigthly
+# grep = { version = ">= 0.2.8", features = ["simd-accel"] }
+
+[features]
+simd-accel = ["grep/simd-accel"]
