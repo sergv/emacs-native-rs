@@ -16,6 +16,9 @@ use pathdiff;
 
 pub mod find;
 pub mod fuzzy_match;
+pub mod path;
+
+use path::EmacsPath;
 
 emacs::use_symbols!(nil make_egrep_match setcdr);
 
@@ -236,39 +239,6 @@ fn grep<'a>(
     results.finalize()?.into_lisp(env)
 }
 
-struct EmacsPath {
-    path: String,
-}
-
-impl EmacsPath {
-    fn new(path: PathBuf) -> result::Result<Self, Error> {
-        match path.into_os_string().into_string() {
-            Err(err) => Err(Error::msg(format!("Path has invalid utf8 encoding: {:?}", err))),
-            Ok(s) => {
-                #[cfg(target_family = "windows")]
-                let path = unsafe {
-                    for b in s.as_bytes_mut() {
-                        match b {
-                            b'\\' => *b = b'/',
-                            _ => (),
-                        }
-                    }
-                    s
-                };
-                #[cfg(target_family = "unix")]
-                let path = s;
-                Ok(EmacsPath { path })
-            }
-        }
-    }
-}
-
-impl<'a> emacs::IntoLisp<'a> for &EmacsPath {
-    fn into_lisp(self, env: &'a Env) -> Result<Value<'a>> {
-        self.path.clone().into_lisp(env)
-    }
-}
-
 struct Match {
     line: u64,
     byte_offset: u64,
@@ -346,7 +316,7 @@ impl<'a, 'b, 'c> searcher::Sink for GrepSink<'a, 'b, 'c> {
                     ))),
                     Some(x) => x,
                 };
-                self.rel_path_cache = Some(Arc::new(EmacsPath::new(path)?));
+                self.rel_path_cache = Some(Arc::new(EmacsPath::new(path).map_err(Error::msg)?));
                 self.rel_path_cache.as_ref().unwrap()
             }
         };
@@ -354,7 +324,7 @@ impl<'a, 'b, 'c> searcher::Sink for GrepSink<'a, 'b, 'c> {
         let abs_path = match self.abs_path_cache {
             Some(ref x) => x,
             None => {
-                self.abs_path_cache = Some(Arc::new(EmacsPath::new(self.abs_path.to_owned())?));
+                self.abs_path_cache = Some(Arc::new(EmacsPath::new(self.abs_path.to_owned()).map_err(Error::msg)?));
                 self.abs_path_cache.as_ref().unwrap()
             }
         };
