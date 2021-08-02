@@ -247,7 +247,7 @@ impl Root for Arc<PathBuf> {
 pub fn find_rec<'a, Str, Iter, Consume, OrigRoot, Res, HandleFile, InitThread, State>(
     roots: Iter,
     ignores: &Ignores,
-    mut init_thread: InitThread,
+    init_thread: InitThread,
     handle_file: HandleFile,
     mut consume: Consume,
 ) -> Result<()>

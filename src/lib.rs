@@ -1,5 +1,5 @@
 
-#![allow(unused_mut)]
+#![allow(dead_code)]
 
 use std::iter::IntoIterator;
 use std::path::{PathBuf, Path};
@@ -17,39 +17,72 @@ use pathdiff;
 pub mod find;
 pub mod fuzzy_match;
 
-emacs::use_symbols!(nil make_egrep_match);
+emacs::use_symbols!(nil make_egrep_match setcdr);
 
 // Emacs won't load the module without this.
 emacs::plugin_is_GPL_compatible!();
 
 // Register the initialization hook that Emacs will call when it loads the module.
-#[emacs::module(name = "emacs_native")]
+#[emacs::module(name = "rust_native")]
 fn init(env: &Env) -> Result<Value<'_>> {
     ().into_lisp(env)
 }
 
 #[defun]
-fn binary_search<'a>(
-    needle: i64,
-    haystack: Vector,
-) -> Result<bool>
+fn score_matches<'a>(
+    env: &'a Env,
+    needle: String,
+    haystacks: Value<'a>,
+) -> Result<Value<'a>>
 {
-    let mut start = 0;
-    let mut end = haystack.len();
-    let mut mid = end / 2;
-    while start != end {
-        let x: i64 = i64::from_lisp(haystack.get(mid)?)?;
-        if x == needle {
-            return Ok(true);
-        }
-        if x < needle {
-            start = mid + 1;
-        } else {
-            end = mid;
-        }
-        mid = (start + end) / 2;
+    let mut reuse = fuzzy_match::ReuseState::new();
+
+    let mut scored = Vec::new();
+
+    for haystack in ListIter::new(haystacks) {
+        let haystack = haystack?;
+        let haystack_str: String = haystack.clone().into_rust()?;
+
+        let m: fuzzy_match::Match<()> = fuzzy_match::fuzzy_match(
+            &needle,
+            &haystack_str,
+            &[],
+            &mut reuse
+        );
+
+        scored.push((m.score, haystack_str, haystack));
     }
-    return Ok(false)
+
+    scored.sort_unstable_by(
+        |(x, xstr, _), (y, ystr, _)| {
+            // Resolve equal scores by comparing lengths.
+            x.cmp(y).then_with(|| xstr.len().cmp(&ystr.len()))
+        });
+
+    let mut results = SuccessesList::new(env)?;
+    for (_, _, s) in scored {
+        results.update(s)?;
+    }
+    results.finalize()
+}
+
+#[defun]
+fn score_single_match<'a>(
+    env: &'a Env,
+    needle: String,
+    haystack: String,
+) -> Result<Value<'a>>
+{
+    let mut reuse = fuzzy_match::ReuseState::new();
+
+    let m: fuzzy_match::Match<Vec<fuzzy_match::StrIdx>> = fuzzy_match::fuzzy_match(
+        &needle,
+        &haystack,
+        &[],
+        &mut reuse,
+    );
+
+    env.cons(m.score.into_lisp(env)?, to_list(env, m.positions.iter().copied())?)
 }
 
 #[defun]
@@ -152,7 +185,6 @@ fn grep<'a>(
     input_case_insensitive: Value,
 ) -> Result<Value<'a>>
 {
-    // let roots_count = input_roots.len();
     let roots = to_strings_iter(input_roots);
 
     let globs = to_strings_iter(input_globs);
@@ -161,11 +193,11 @@ fn grep<'a>(
     let ignored_dir_prefixes_globs = to_strings_iter(input_ignored_dir_prefixes_globs);
     let ignored_abs_dirs = to_strings_iter(input_ignored_abs_dirs);
 
-    let case_insensitive = !nil.bind(env).eq(input_case_insensitive);
+    let case_insensitive = !input_case_insensitive.is_not_nil();
 
     let ignores = find::Ignores::new(globs, ignored_file_globs, ignored_dir_globs, ignored_dir_prefixes_globs, ignored_abs_dirs)?;
 
-    let mut results = Successes::new(env)?;
+    let mut results = SuccessesVec::new(env)?;
 
     find::find_rec(
         roots,
@@ -203,13 +235,6 @@ fn grep<'a>(
 
     results.finalize()?.into_lisp(env)
 }
-
-// fn extract_strings(input: Vector) -> Result<Vec<String>> {
-//     input
-//         .into_iter()
-//         .map(String::from_lisp)
-//         .collect::<Result<_>>()
-// }
 
 struct EmacsPath {
     path: String,
@@ -271,7 +296,9 @@ impl<'a> emacs::IntoLisp<'a> for Match {
 }
 
 struct GrepSink<'a, 'b, 'c> {
+    // Cached relative path of currently processedfile.
     rel_path_cache: Option<Arc<EmacsPath>>,
+    // Cached absolute path of currently processedfile.
     abs_path_cache: Option<Arc<EmacsPath>>,
     abs_path: &'a Path,
     orig_root: &'a Path,
@@ -352,20 +379,6 @@ impl<'a, 'b, 'c> searcher::Sink for GrepSink<'a, 'b, 'c> {
             abs_path: abs_path.clone(),
         }).map_err(|err| Error::msg(format!("Failed to send match: {}", err)))?;
 
-        // println!(
-        //     "{}:{}@{}@@{:?}:{:?}",
-        //     rel_path.display(),
-        //     line,
-        //     offset,
-        //     m.bytes_range_in_buffer(),
-        //     submatch
-        //     // std::str::from_utf8(text)
-        // );
-
-        // let len = m.
-
-            // env.call_unprotected("", args)
-
         Ok(true)
     }
 }
@@ -400,6 +413,7 @@ fn take<'a>(env: &'a Env, count: usize, v: Vector<'a>) -> Result<Vector<'a>> {
     Ok(res)
 }
 
+/// State for incrementally collecting potentially faliing results into a vector.
 struct SuccessesAndErrors<'a> {
     env: &'a Env,
 
@@ -462,7 +476,8 @@ impl<'a> SuccessesAndErrors<'a> {
     }
 }
 
-struct Successes<'a> {
+/// State for incrementally collecting successful results into a vector.
+struct SuccessesVec<'a> {
     env: &'a Env,
 
     items: Vector<'a>,
@@ -470,9 +485,9 @@ struct Successes<'a> {
     size: usize,
 }
 
-impl<'a> Successes<'a> {
-    fn new(env: &'a Env) -> Result<Successes> {
-        Ok(Successes {
+impl<'a> SuccessesVec<'a> {
+    fn new(env: &'a Env) -> Result<SuccessesVec> {
+        Ok(SuccessesVec {
             env,
             items: env.make_vector(0, nil)?,
             cap: 0,
@@ -497,5 +512,109 @@ impl<'a> Successes<'a> {
     fn finalize(self) -> Result<Vector<'a>> {
         let a = take(self.env, self.size, self.items)?;
         Ok(a)
+    }
+}
+
+/// State for incrementally collecting successful results into a list.
+struct SuccessesList<'a> {
+    env: &'a Env,
+
+    store: Value<'a>,
+    last_cell: Value<'a>,
+}
+
+impl<'a> SuccessesList<'a> {
+    fn new(env: &'a Env) -> Result<SuccessesList> {
+        let tmp = env.cons(nil, nil)?;
+        Ok(SuccessesList {
+            env,
+            store: tmp,
+            last_cell: tmp,
+        })
+    }
+
+    fn update<A>(&mut self, x: A) -> Result<()>
+        where
+        A: IntoLisp<'a>,
+    {
+        self.last_cell =
+            self.env.call(
+                setcdr,
+                (self.last_cell, self.env.cons(x.into_lisp(self.env)?, nil)?)
+            )?;
+        Ok(())
+    }
+
+    fn finalize(self) -> Result<Value<'a>> {
+        self.store.cdr()
+    }
+}
+
+fn to_list<'a, I, A>(env: &'a Env, iter: I) -> emacs::Result<Value<'a>>
+    where
+    I: Iterator<Item = A>,
+    A: IntoLisp<'a>,
+{
+    let mut s = SuccessesList::new(env)?;
+    for x in iter {
+        s.update(x)?;
+    }
+    s.finalize()
+}
+
+struct ListIter<'a> {
+    list: Value<'a>,
+}
+
+impl<'a> ListIter<'a> {
+    fn new(list: Value<'a>) -> Self {
+        ListIter { list }
+    }
+}
+
+impl<'a> Iterator for ListIter<'a> {
+    type Item = emacs::Result<Value<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.list.is_not_nil() {
+            let rest = match self.list.cdr() {
+                Err(err) => return Some(Err(err)),
+                Ok(x) => x,
+            };
+            let x = match self.list.car() {
+                Err(err) => return Some(Err(err)),
+                Ok(x) => x,
+            };
+            self.list = rest;
+            Some(Ok(x))
+        } else {
+            None
+        }
+    }
+}
+
+struct DecodingListIter<'a, A> {
+    iter: ListIter<'a>,
+    item: std::marker::PhantomData<A>,
+}
+
+impl<'a, A> DecodingListIter<'a, A> {
+    fn new(list: Value<'a>) -> Self {
+        DecodingListIter {
+            iter: ListIter::new(list),
+            item: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, A: FromLisp<'a>> Iterator for DecodingListIter<'a, A> {
+    type Item = emacs::Result<A>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.iter.next() {
+            None => None,
+            Some(Err(err)) => Some(Err(err)),
+            Some(Ok(x)) => Some(A::from_lisp(x)),
+        }
     }
 }
