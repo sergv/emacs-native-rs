@@ -99,7 +99,6 @@ fn find_rec<'a>(
     input_ignored_abs_dirs: Vector,
 ) -> Result<Value<'a>>
 {
-    // let roots_count = input_roots.len();
     let roots = to_strings_iter(input_roots);
 
     let globs = to_strings_iter(input_globs);
