@@ -58,8 +58,9 @@ fn score_matches<'a>(
 
     scored.sort_unstable_by(
         |(x, xstr, _), (y, ystr, _)| {
+            // Propagate greatest score to the beginning.
             // Resolve equal scores by comparing lengths.
-            x.cmp(y).then_with(|| xstr.len().cmp(&ystr.len()))
+            x.cmp(y).reverse().then_with(|| xstr.len().cmp(&ystr.len()))
         });
 
     let mut results = SuccessesList::new(env)?;
