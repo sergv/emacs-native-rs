@@ -9,9 +9,9 @@ use std::sync::{Arc, mpsc};
 use anyhow;
 use emacs;
 use emacs::{defun, Env, Result, Value, Vector, FromLisp, IntoLisp};
-use grep::matcher::Matcher;
-use grep::regex::{RegexMatcher, RegexMatcherBuilder};
-use grep::searcher::{self, Searcher, SearcherBuilder};
+use grep_matcher::Matcher;
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{self, Searcher, SearcherBuilder};
 use pathdiff;
 
 pub mod find;
@@ -208,8 +208,8 @@ fn grep<'a>(
             let searcher = SearcherBuilder::new()
                 .line_number(true)
                 .multi_line(true)
-                .memory_map(unsafe { grep::searcher::MmapChoice::auto() })
-                .binary_detection(grep::searcher::BinaryDetection::none())
+                .memory_map(unsafe { grep_searcher::MmapChoice::auto() })
+                .binary_detection(grep_searcher::BinaryDetection::none())
                 .build();
 
             let matcher = RegexMatcherBuilder::new()
@@ -290,16 +290,16 @@ impl Error {
     }
 }
 
-impl searcher::SinkError for Error {
+impl grep_searcher::SinkError for Error {
     fn error_message<T: std::fmt::Display>(message: T) -> Self {
         Error::msg(message.to_string())
     }
 }
 
-impl<'a, 'b, 'c> searcher::Sink for GrepSink<'a, 'b, 'c> {
+impl<'a, 'b, 'c> grep_searcher::Sink for GrepSink<'a, 'b, 'c> {
     type Error = Error;
 
-    fn matched(&mut self, _searcher: &Searcher, m: &searcher::SinkMatch) -> result::Result<bool, Self::Error> {
+    fn matched(&mut self, _searcher: &Searcher, m: &grep_searcher::SinkMatch) -> result::Result<bool, Self::Error> {
         let line = m.line_number().expect("Line numbers must be available");
         // Add 1 since in Emacs byte offsets are 1-based.
         let byte_offset = m.absolute_byte_offset() + 1;
