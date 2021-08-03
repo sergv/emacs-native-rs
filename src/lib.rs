@@ -85,7 +85,7 @@ fn score_single_match<'a>(
         &mut reuse,
     );
 
-    env.cons(m.score.into_lisp(env)?, to_list(env, m.positions.iter().copied())?)
+    env.cons(m.score.into_lisp(env)?, to_list(env, m.positions.into_iter())?)
 }
 
 #[defun]
