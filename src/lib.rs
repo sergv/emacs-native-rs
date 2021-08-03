@@ -360,7 +360,10 @@ fn path_to_string(path: PathBuf) -> result::Result<String, String> {
     }
 }
 
-fn to_strings_iter<'a>(input: Vector<'a>) -> impl Iterator<Item = Result<String>> + ExactSizeIterator + 'a {
+fn to_strings_iter<'a>(
+    input: Vector<'a>
+) -> std::iter::Map<<Vector as IntoIterator>::IntoIter, fn(Value<'a>) -> emacs::Result<String>>
+{
     input
         .into_iter()
         .map(String::from_lisp)
