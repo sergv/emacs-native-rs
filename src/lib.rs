@@ -28,7 +28,7 @@ emacs::plugin_is_GPL_compatible!();
 // Register the initialization hook that Emacs will call when it loads the module.
 #[emacs::module(name = "rust_native")]
 fn init(env: &Env) -> Result<Value<'_>> {
-    ().into_lisp(env)
+    Ok(nil.bind(env))
 }
 
 #[defun]
