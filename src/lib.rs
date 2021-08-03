@@ -195,7 +195,7 @@ fn grep<'a>(
     let ignored_dir_prefixes_globs = to_strings_iter(input_ignored_dir_prefixes_globs);
     let ignored_abs_dirs = to_strings_iter(input_ignored_abs_dirs);
 
-    let case_insensitive = !input_case_insensitive.is_not_nil();
+    let case_insensitive = input_case_insensitive.is_not_nil();
 
     let ignores = find::Ignores::new(globs, ignored_file_globs, ignored_dir_globs, ignored_dir_prefixes_globs, ignored_abs_dirs)?;
 
