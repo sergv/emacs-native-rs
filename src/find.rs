@@ -250,6 +250,7 @@ impl Root for Arc<PathBuf> {
 // Define a function callable by Lisp.
 pub fn find_rec<'a, Str, Iter, Consume, OrigRoot, Res, HandleFile, InitThread, State>(
     roots: Iter,
+    roots_count: usize,
     ignores: &Ignores,
     init_thread: InitThread,
     handle_file: HandleFile,
@@ -257,7 +258,7 @@ pub fn find_rec<'a, Str, Iter, Consume, OrigRoot, Res, HandleFile, InitThread, S
 ) -> Result<()>
     where
     Str: AsRef<str>,
-    Iter: Iterator<Item = Result<Str>> + ExactSizeIterator,
+    Iter: Iterator<Item = Result<Str>>,
     Consume: FnMut(Res) -> Result<()>,
     OrigRoot: Root + std::fmt::Debug,
     Res: Send + 'static,
@@ -265,14 +266,13 @@ pub fn find_rec<'a, Str, Iter, Consume, OrigRoot, Res, HandleFile, InitThread, S
     InitThread: FnMut() -> Result<State> + Send + Clone,
 {
     let (report_result, receive_result) = mpsc::sync_channel(2 * THREADS);
-    let roots_count = roots.len();
 
     let tasks_queue = ArrayQueue::new((10 * THREADS).max(roots_count));
 
     for r in roots {
         let path = std::path::PathBuf::from(std::ffi::OsString::from(r?.as_ref()));
         if !ignores.ignored_dirs.abs.is_match(&path) && !ignores.ignored_dirs.rel.is_match(&path) {
-            tasks_queue.push((Root::from_path(&path), path.clone())).expect("Task queue should have enough size to hold initial set of roots");
+            tasks_queue.push((Root::from_path(&path), path)).expect("Task queue should have enough size to hold initial set of roots");
         }
     }
 
