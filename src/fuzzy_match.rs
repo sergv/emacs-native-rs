@@ -131,7 +131,7 @@ mod occurs {
             f(&mut r.vec)
         }
 
-        // Take care since vec can be mutated  while original PositionsState is still being retained.
+        // Take care since vec can be mutated while original PositionsState is still being retained.
         unsafe fn as_vec<'a>(&mut self) -> Vec<Positions<'a>>
         {
             // Not much need to zero everything out if we require user to check that by hand!!
@@ -276,7 +276,7 @@ pub fn fuzzy_match<'a, 'b, 'c, 'd, PS>(
     )
 }
 
-pub fn fuzzy_match_impl<'a, 'b, 'c, 'd, 'e, 'f, PS>(
+fn fuzzy_match_impl<'a, 'b, 'c, 'd, 'e, 'f, PS>(
     occurs_reuse: &'a mut occurs::ReuseState,
     needle: &'b str,
     haystack: &'c str,
@@ -344,7 +344,7 @@ fn is_score_better(new: i16, old: i16) -> bool {
 }
 
 // Terminal submatch, doesn’t get filled.
-const TERMIAL_SUBMATCH: SubmatchIdx = -1;
+const TERMINAL_SUBMATCH: SubmatchIdx = -1;
 
 fn match_singleton_needle<'a, 'b>(
     heatmap: &'a [Heat],
@@ -358,7 +358,7 @@ fn match_singleton_needle<'a, 'b>(
             score,
             position: *idx,
             contiguous_count: 0,
-            prev: TERMIAL_SUBMATCH
+            prev: TERMINAL_SUBMATCH
         };
 
         for idx in remaining_occurs {
@@ -380,20 +380,18 @@ fn top_down_match<'a, 'b, 'c, 'd, 'e>(
     submatches: &'b mut Vec<Submatch>,
     heatmap: &'c [Heat],
     positions: &'d Vec<&'e [StrIdx]>,
-    needle_idx: StrIdx,
+    haystack_idx: StrIdx,
     cutoff_idx: StrIdx,
     end_idx: StrIdx,
 ) -> Option<SubmatchIdx>
 {
-    let key = (needle_idx, cutoff_idx);
+    let key = (haystack_idx, cutoff_idx);
     match cache.get(&key) {
         Some(res) => return *res,
         None => (),
     }
 
-    let remaining_occurs =
-        bigger(cutoff_idx, positions[needle_idx as usize])
-        .iter();
+    let remaining_occurs = bigger(cutoff_idx, positions[haystack_idx as usize]);
 
     let mut max_submatch = None;
     let mut max_score = -1;
@@ -405,7 +403,7 @@ fn top_down_match<'a, 'b, 'c, 'd, 'e>(
             submatches,
             heatmap,
             positions,
-            needle_idx + 1,
+            haystack_idx + 1,
             *idx,
             end_idx,
         );
@@ -484,7 +482,7 @@ fn top_down_submatch_at<'a, 'b, 'c, 'd, 'e>(
                 score: score2,
                 position: *idx2,
                 contiguous_count: 0,
-                prev: TERMIAL_SUBMATCH, // Does not get filled out - terminal submatch.
+                prev: TERMINAL_SUBMATCH, // Does not get filled out - terminal submatch.
             };
 
             for idx3 in remaining_occurs {
