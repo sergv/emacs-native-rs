@@ -11,7 +11,7 @@ path = "src/lib.rs"
 
 [[bench]]
 name = "bench-fs-search"
-path = "src/bin/bench_fs_search.rs"
+path = "src/bench/bench_fs_search.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
