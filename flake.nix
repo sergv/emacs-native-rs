@@ -11,100 +11,69 @@
 
     # nixpkgs.url = "nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-
-    # rust-overlay = {
-    #   url = "github:oxalica/rust-overlay";
-    #   inputs.nixpkgs.follows = "nixpkgs";
-    # };
-
-    # pre-commit-hooks.url = "github:cachix/pre-commit-hooks.nix";
-    # gitignore = {
-    #   url = "github:hercules-ci/gitignore.nix";
-    #   inputs.nixpkgs.follows = "nixpkgs";
-    # };
   };
 
   outputs = {
     self,
     nixpkgs,
     flake-utils,
-    # gitignore,
-    # rust-overlay,
-    # pre-commit-hooks,
     ...
   }:
     flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {
         inherit system;
-        # overlays = [
-        #   rust-overlay.overlays.default
-        # ];
       };
 
-      # inherit (gitignore.lib) gitignoreSource;
-      # pre-commit-check = pre-commit-hooks.lib.${system}.run {
-      #   src = gitignoreSource ./.;
-      #   hooks = {
-      #     alejandra.enable = true;
-      #     rustfmt.enable = true;
-      #   };
-      # };
+      libclang = pkgs.libclang;
 
-      rust = pkgs.rust-bin.stable.latest.default;
+      devTools = [pkgs.rustfmt pkgs.clippy];
 
-      # rustWasm = rust.override {
-      #   targets = ["wasm32-unknown-unknown"];
-      # };
-
-      emacs_module_rs_package = pkgs.rustPlatform.buildRustPackage {
-        pname = "emacs_module_rs";
+      emacs-native-rs-package = pkgs.rustPlatform.buildRustPackage {
+        pname = "emacs-native-rs";
         version = "0.1.0";
 
         src = ./.;
         cargoLock = {
           lockFile = ./Cargo.lock;
         };
-        buildInputs = [
-          pkgs.libclang
+        nativeBuildInputs = [
+          libclang
         ];
 
-        # nativeBuildInputs = [rust pkgs.makeWrapper];
-        # postInstall = ''
-        #   wrapProgram "$out/bin/egui-playground-bin" --prefix LD_LIBRARY_PATH : "${libPath}"
-        # '';
-      };
+        LIBCLANG_PATH = pkgs.lib.makeLibraryPath [ libclang.lib ];
 
-      # # Required by egui
-      # libPath = with pkgs;
-      #   lib.makeLibraryPath [
-      #     libGL
-      #     libxkbcommon
-      #     wayland
-      #     xorg.libX11
-      #     xorg.libXcursor
-      #     xorg.libXi
-      #     xorg.libXrandr
-      #   ];
+        # RUSTFLAGS="-C target-cpu=native"
+        extraRustcOpts = "-C target-cpu=native";
+
+        # Mostly for bindgen
+        preBuild = ''
+          # From: https://github.com/NixOS/nixpkgs/blob/1fab95f5190d087e66a3502481e34e15d62090aa/pkgs/applications/networking/browsers/firefox/common.nix#L247-L253
+          # Set C flags for Rust's bindgen program. Unlike ordinary C
+          # compilation, bindgen does not invoke $CC directly. Instead it
+          # uses LLVM's libclang. To make sure all necessary flags are
+          # included we need to look in a few places.
+          export BINDGEN_EXTRA_CLANG_ARGS="$(< ${pkgs.stdenv.cc}/nix-support/libc-crt1-cflags) \
+            $(< ${pkgs.stdenv.cc}/nix-support/libc-cflags) \
+            $(< ${pkgs.stdenv.cc}/nix-support/cc-cflags) \
+            $(< ${pkgs.stdenv.cc}/nix-support/libcxx-cxxflags) \
+            ${pkgs.lib.optionalString pkgs.stdenv.cc.isClang "-idirafter ${pkgs.stdenv.cc.cc.lib}/lib/clang/${pkgs.lib.getVersion pkgs.stdenv.cc.cc}/include"} \
+            ${pkgs.lib.optionalString pkgs.stdenv.cc.isGNU "-isystem ${pkgs.lib.getDev pkgs.stdenv.cc.cc}/include/c++/${pkgs.lib.getVersion pkgs.stdenv.cc.cc} -isystem ${pkgs.stdenv.cc.cc}/include/c++/${pkgs.lib.getVersion pkgs.stdenv.cc.cc}/${pkgs.stdenv.hostPlatform.config} -isystem ${pkgs.stdenv.cc.cc}/lib/gcc/${pkgs.stdenv.hostPlatform.config}/${pkgs.lib.getVersion pkgs.stdenv.cc.cc}/include"}"
+        '';
+      };
 
     in {
       packages = {
-        emacs_module_rs = emacs_module_rs_package;
-        default         = emacs_module_rs_package;
+        emacs_module_rs = emacs-native-rs-package;
+        default         = emacs-native-rs-package;
       };
       devShells = {
-        default = pkgs.mkShell rec {
-          buildInputs = [pkgs.rustfmt pkgs.rustc pkgs.cargo];
-          # inherit (pre-commit-check) shellHook;
-          # LD_LIBRARY_PATH = libPath;
+        default = emacs-native-rs-package.overrideAttrs (old: {
+          buildInputs        = old.buildInputs ++ devTools;
           NIX_DEVELOP_PROMPT = "[nix]";
-        };
+          shellHook          = ''
+            export PATH="${pkgs.lib.makeBinPath devTools}:$PATH"
+          '';
+        });
       };
-      # apps = {
-      #   gui = {
-      #     type = "app";
-      #     program = "${packages.default}/bin/egui-playground-bin";
-      #   };
-      #   default = apps.gui;
-      # };
     });
 }
