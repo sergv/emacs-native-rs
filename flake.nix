@@ -68,11 +68,8 @@
       };
       devShells = {
         default = emacs-native-rs-package.overrideAttrs (old: {
-          buildInputs        = old.buildInputs ++ devTools;
+          nativeBuildInputs  = old.nativeBuildInputs or [] ++ devTools;
           NIX_DEVELOP_PROMPT = "[nix]";
-          shellHook          = ''
-            export PATH="${pkgs.lib.makeBinPath devTools}:$PATH"
-          '';
         });
       };
     });
