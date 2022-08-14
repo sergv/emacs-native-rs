@@ -62,6 +62,10 @@
       };
 
     in {
+
+      # legacyPackages."<system>"."<name>"
+      legacyPackages.emacs_module_rs = emacs-native-rs-package;
+
       packages = {
         emacs_module_rs = emacs-native-rs-package;
         default         = emacs-native-rs-package;
