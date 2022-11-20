@@ -70,10 +70,10 @@
         emacs_module_rs = emacs-native-rs-package;
         default         = emacs-native-rs-package;
       };
+
       devShells = {
         default = emacs-native-rs-package.overrideAttrs (old: {
           nativeBuildInputs  = old.nativeBuildInputs or [] ++ devTools;
-          NIX_DEVELOP_PROMPT = "[nix]";
         });
       };
     });
